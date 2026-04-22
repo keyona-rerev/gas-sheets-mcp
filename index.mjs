@@ -1,8 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import fetch from "node-fetch";
 import http from "http";
+import { randomUUID } from "crypto";
 
 const GAS_URL   = process.env.SHEETS_GAS_URL;
 const GAS_TOKEN = process.env.SHEETS_GAS_TOKEN;
@@ -24,10 +25,10 @@ async function callGAS(action, params = {}) {
   return json.data;
 }
 
-const transports = new Map();
+const sessions = new Map();
 
 function buildServer() {
-  const server = new McpServer({ name: "google-sheets", version: "1.0.0" });
+  const server = new McpServer({ name: "google-sheets", version: "2.0.0" });
 
   server.tool(
     "sheets_list_spreadsheets",
@@ -207,39 +208,51 @@ function buildServer() {
 
 const httpServer = http.createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id");
 
-  if (req.method === "OPTIONS") {
-    res.writeHead(204); res.end(); return;
-  }
+  if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", service: "google-sheets-mcp" }));
+    res.end(JSON.stringify({ status: "ok", service: "google-sheets-mcp", transport: "streamable-http" }));
     return;
   }
 
-  if (req.method === "GET" && req.url === "/mcp") {
-    const server = buildServer();
-    const transport = new SSEServerTransport("/messages", res);
-    transports.set(transport.sessionId, transport);
-    res.on("close", () => transports.delete(transport.sessionId));
-    await server.connect(transport);
-    return;
-  }
+  if (req.url === "/mcp" || req.url.startsWith("/mcp?")) {
+    const sessionId = req.headers["mcp-session-id"];
 
-  if (req.method === "POST" && req.url.startsWith("/messages")) {
-    const url = new URL(req.url, "http://localhost");
-    const sessionId = url.searchParams.get("sessionId");
-    const transport = transports.get(sessionId);
-    if (!transport) {
-      res.writeHead(404);
-      res.end(JSON.stringify({ error: "Session not found" }));
+    if (req.method === "DELETE") {
+      if (sessionId && sessions.has(sessionId)) {
+        const { transport } = sessions.get(sessionId);
+        await transport.close();
+        sessions.delete(sessionId);
+      }
+      res.writeHead(204); res.end();
       return;
     }
-    await transport.handlePostMessage(req, res);
-    return;
+
+    if (req.method === "GET" || req.method === "POST") {
+      let transport, server;
+
+      if (sessionId && sessions.has(sessionId)) {
+        ({ transport, server } = sessions.get(sessionId));
+      } else {
+        const newSessionId = randomUUID();
+        server = buildServer();
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => newSessionId,
+          onsessioninitialized: (sid) => {
+            sessions.set(sid, { transport, server });
+          },
+        });
+        transport.onclose = () => sessions.delete(newSessionId);
+        await server.connect(transport);
+      }
+
+      await transport.handleRequest(req, res);
+      return;
+    }
   }
 
   res.writeHead(404);
@@ -247,5 +260,5 @@ const httpServer = http.createServer(async (req, res) => {
 });
 
 httpServer.listen(PORT, () => {
-  console.log(`Google Sheets MCP (SSE) running on port ${PORT}`);
+  console.log(`Google Sheets MCP (Streamable HTTP) running on port ${PORT}`);
 });
